@@ -1,5 +1,4 @@
 use std::{
-    convert::TryInto,
     fmt::{Arguments, Display, Formatter, Result as FmtResult},
     fs::File,
     io::{stdin, stdout, Error as IOError, Read, Stdin, Stdout, StdoutLock, Write},

@@ -1,5 +1,4 @@
 use std::{
-    convert::TryInto,
     fs::File as FileSync,
     future::Future,
     io::{stdin, stdout, Error as IOError, Read, Stdout, StdoutLock, Write},
