@@ -348,7 +348,7 @@ async fn list_directory(
     Ok(())
 }
 
-async fn download_file(
+async fn client_download_file(
     stream: &mut TlsStream<TcpStream>,
     effective_path: &str,
     name: &str,
@@ -496,7 +496,7 @@ async fn handle_client_loop(
                     .map_err(|error: IOError| error.to_string())?;
             }
             Command::DownloadFile(name) if validate_path_segment(&name) => {
-                download_file(&mut stream, &effective_path, &name)
+                client_download_file(&mut stream, &effective_path, &name)
                     .await
                     .map_err(|error: IOError| error.to_string())?
             }
