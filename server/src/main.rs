@@ -1,7 +1,8 @@
 use std::{
+    cmp::Ordering,
     fs::File as FileSync,
     future::Future,
-    io::{stdin, stdout, Error as IOError, Read, Stdout, StdoutLock, Write},
+    io::{stdin, stdout, Error as IOError, Read, SeekFrom, Stdout, StdoutLock, Write},
     pin::Pin,
     string::FromUtf8Error,
     sync::Arc,
@@ -11,11 +12,11 @@ use std::{
 
 use sha2::{
     digest::{consts::U64, generic_array::GenericArray},
-    Digest, Sha512,
+    Digest, Sha256, Sha512,
 };
 use tokio::{
     fs::{read_dir, File, ReadDir},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     macros::support::poll_fn,
     net::{TcpListener, TcpStream},
     pin, spawn,
@@ -198,8 +199,15 @@ enum Command {
     EnterDirectory(String),
     LeaveDirectory,
     DownloadFile(String),
+}
 
-    UnknownCommand,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DownloadSubcommand {
+    KeepAlive,
+    List(u16),
+    ChunkHash(u64, u16),
+    DownloadChunk(u64, u16),
+    CloseFile,
 }
 
 fn validate_path_segment(segment: &str) -> bool {
@@ -259,7 +267,50 @@ async fn read_client_command(stream: &mut TlsStream<TcpStream>) -> Result<Comman
         3 => Command::EnterDirectory(read_string(stream).await?),
         4 => Command::LeaveDirectory,
         5 => Command::DownloadFile(read_string(stream).await?),
-        _ => Command::UnknownCommand,
+        _ => return Err(String::from("Client sent unknown command!")),
+    })
+}
+
+async fn read_client_download_subcommand(
+    stream: &mut TlsStream<TcpStream>,
+) -> Result<DownloadSubcommand, String> {
+    async fn read_chunk_size(stream: &mut TlsStream<TcpStream>) -> Result<u16, String> {
+        let chunk_size: u16 = stream
+            .read_u16_le()
+            .await
+            .map_err(|error: IOError| error.to_string())?;
+
+        if chunk_size == 0 {
+            Err(String::from("Client specified zero as chunk size!"))
+        } else {
+            Ok(chunk_size)
+        }
+    }
+
+    let command_byte: u8 = stream
+        .read_u8()
+        .await
+        .map_err(|error: IOError| error.to_string())?;
+
+    Ok(match command_byte {
+        0 => DownloadSubcommand::KeepAlive,
+        1 => DownloadSubcommand::List(read_chunk_size(stream).await?),
+        2 => DownloadSubcommand::ChunkHash(
+            stream
+                .read_u64_le()
+                .await
+                .map_err(|error: IOError| error.to_string())?,
+            read_chunk_size(stream).await?,
+        ),
+        3 => DownloadSubcommand::DownloadChunk(
+            stream
+                .read_u64_le()
+                .await
+                .map_err(|error: IOError| error.to_string())?,
+            read_chunk_size(stream).await?,
+        ),
+        4 => DownloadSubcommand::CloseFile,
+        _ => return Err(String::from("Client sent unknown download command!")),
     })
 }
 
@@ -352,16 +403,24 @@ async fn client_download_file(
     stream: &mut TlsStream<TcpStream>,
     effective_path: &str,
     name: &str,
-) -> Result<(), IOError> {
+) -> Result<(), String> {
     let name: String = String::from(effective_path) + "/" + name;
 
-    let mut file: File = File::open(&name).await?;
+    let mut file: File = File::open(&name)
+        .await
+        .map_err(|error: IOError| error.to_string())?;
 
     let length: u64 = match file.metadata().await {
         Ok(metadata) => {
-            stream.write_u8(0).await?;
+            stream
+                .write_u8(0)
+                .await
+                .map_err(|error: IOError| error.to_string())?;
 
-            stream.write_u64_le(metadata.len()).await?;
+            stream
+                .write_u64_le(metadata.len())
+                .await
+                .map_err(|error: IOError| error.to_string())?;
 
             metadata.len()
         }
@@ -371,48 +430,128 @@ async fn client_download_file(
                 name, error
             );
 
-            stream.write_u8(0xFF).await?;
+            stream
+                .write_u8(0xFF)
+                .await
+                .map_err(|error: IOError| error.to_string())?;
 
             return Ok(());
         }
     };
 
-    let mut buffer: [u8; 4096] = [0; 4096];
+    loop {
+        match read_client_download_subcommand(stream).await? {
+            DownloadSubcommand::KeepAlive => stream
+                .write_u8(0)
+                .await
+                .map_err(|error: IOError| error.to_string())?,
+            DownloadSubcommand::List(chunk_size) => {
+                let chunk_size: u32 = chunk_size.wrapping_shl(4) as u32;
 
-    for _ in 0..(length >> 12) {
-        if let Err(error) = file.read_exact(&mut buffer).await {
-            eprintln!(
-                "[ERROR] Couldn't read full chunk from '{}'! Error message: {}",
-                name, error
-            );
+                stream
+                    .write_u8(0)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
 
-            stream.write_u8(0xFF).await?;
+                stream
+                    .write_u64_le(length / chunk_size as u64)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
 
-            return Ok(());
+                {
+                    let last_chunk_size: [u8; 4] =
+                        ((length % chunk_size as u64) as u32).to_le_bytes();
+
+                    for index in 0..3 {
+                        stream
+                            .write_u8(last_chunk_size[index])
+                            .await
+                            .map_err(|error: IOError| error.to_string())?;
+                    }
+                }
+            }
+            DownloadSubcommand::ChunkHash(index, chunk_size) => {
+                let chunk_size: u32 = chunk_size.wrapping_shl(4) as u32;
+
+                file.seek(SeekFrom::Start(index.wrapping_mul(chunk_size as u64)))
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                let mut buffer: Box<[u8]> = vec![
+                    0;
+                    match index.cmp(&(length / chunk_size as u64)) {
+                        Ordering::Less => {
+                            chunk_size as usize
+                        }
+                        Ordering::Equal => {
+                            (length % chunk_size as u64) as usize
+                        }
+                        Ordering::Greater => {
+                            return Err(String::from("Client sent chunk index beyond file size!"));
+                        }
+                    }
+                ]
+                .into_boxed_slice();
+
+                file.read_exact(&mut buffer)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                stream
+                    .write_u8(0)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                let mut digest: Sha256 = Sha256::new();
+
+                digest.update(&buffer);
+
+                stream
+                    .write_all(&digest.finalize())
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+            }
+            DownloadSubcommand::DownloadChunk(index, chunk_size) => {
+                let chunk_size: u32 = (chunk_size as u32).wrapping_shl(4);
+
+                file.seek(SeekFrom::Start(index.wrapping_mul(chunk_size as u64)))
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                let mut buffer: Box<[u8]> = vec![
+                    0;
+                    match index.cmp(&(length / chunk_size as u64)) {
+                        Ordering::Less => chunk_size as usize,
+                        Ordering::Equal => (length % chunk_size as u64) as usize,
+                        Ordering::Greater =>
+                            return Err(String::from("Client sent chunk index beyond file size!")),
+                    }
+                ]
+                .into_boxed_slice();
+
+                file.read_exact(&mut buffer)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                stream
+                    .write_u8(0)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                stream
+                    .write_all(&buffer)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+            }
+            DownloadSubcommand::CloseFile => {
+                stream
+                    .write_u8(0)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                break;
+            }
         }
-
-        stream.write_u8(0).await?;
-
-        stream.write_all(&buffer).await?;
-    }
-
-    let length: usize = (length & 0xFFF) as usize;
-
-    if length != 0 {
-        if let Err(error) = file.read_exact(&mut buffer[..length]).await {
-            eprintln!(
-                "[ERROR] Couldn't read last chunk from '{}'! Error message: {}",
-                name, error
-            );
-
-            stream.write_u8(0xFF).await?;
-
-            return Ok(());
-        }
-
-        stream.write_u8(0).await?;
-
-        stream.write_all(&buffer[..length]).await?;
     }
 
     Ok(())
@@ -496,9 +635,7 @@ async fn handle_client_loop(
                     .map_err(|error: IOError| error.to_string())?;
             }
             Command::DownloadFile(name) if validate_path_segment(&name) => {
-                client_download_file(&mut stream, &effective_path, &name)
-                    .await
-                    .map_err(|error: IOError| error.to_string())?
+                client_download_file(&mut stream, &effective_path, &name).await?
             }
             _ => stream
                 .write_u8(0xFF)

@@ -76,7 +76,7 @@ fn main() -> Result<(), &'static str> {
         "For list of supported commands type \"help\"."
     ))?;
 
-    loop {
+    'main_loop: loop {
         console_write(format_args!("{}$ ", Path::new(&remote_path)))?;
 
         let line: String = console_read_line()?;
@@ -101,7 +101,7 @@ fn main() -> Result<(), &'static str> {
                 \tlv, leave <===> Changes the remote working directory to the parent of the current one.\n\
                 \tdl, down, download <remote file> <local file> <===> Download a file from the remote working directory to the local one.\n\
                 \t\tThis will overwrite the local file, if it already exists!\n\
-                \tex, exit <===> Exits while gracefully closing the session."
+                \tx, ex, exit <===> Exits while gracefully closing the session."
             ))?;
 
             continue;
@@ -290,6 +290,21 @@ fn main() -> Result<(), &'static str> {
                             ))?;
 
                             {
+                                stream
+                                    .write_all(&[3])
+                                    .map_err(|_| "Couldn't write to stream!")?;
+
+                                stream
+                                    .write_all(&index.to_le_bytes())
+                                    .map_err(|_| "Couldn't write to stream!")?;
+
+                                // Chunk size shifted by 4 to the right;
+                                // (4096 = 0x1000) >> 4 = 0x100;
+                                // [0, 1] <=> 0x0100 in Little-Endian;
+                                stream
+                                    .write_all(&[0, 1])
+                                    .map_err(|_| "Couldn't write to stream!")?;
+
                                 let mut buffer: [u8; 1] = [0];
 
                                 stream
@@ -297,11 +312,33 @@ fn main() -> Result<(), &'static str> {
                                     .map_err(|_| "Couldn't read from stream!")?;
 
                                 if buffer[0] != 0 {
+                                    stream
+                                        .write_all(&[4])
+                                        .map_err(|_| "Couldn't write to stream!")?;
+
+                                    let mut buffer: [u8; 1] = [0];
+
+                                    stream
+                                        .read_exact(&mut buffer)
+                                        .map_err(|_| "Couldn't read from stream!")?;
+
+                                    if buffer[0] != 0 {
+                                        dbg!(buffer);
+
+                                        console_write_line(format_args!(
+                                        "Failure occured while closing file! Please restart session."
+                                    ))?;
+
+                                        return Err(
+                                            "Communication error occured while closing file!",
+                                        );
+                                    }
+
                                     console_write_line(format_args!(
                                         "Failure occured while downloading file! Please try again."
                                     ))?;
 
-                                    continue;
+                                    continue 'main_loop;
                                 }
                             }
 
@@ -314,11 +351,11 @@ fn main() -> Result<(), &'static str> {
                         }
 
                         console_write(format_args!(
-                            "\rDownload process: {0:>5.2}% [{1:.2} {3}/{2:.2} {3}]",
-                            (length & !0xFFF) as f64 * 100_f64 / length as f64,
-                            (length & !0xFFF) as f64 / size_format.0,
-                            length as f64 / size_format.0,
-                            size_format.1,
+                            "\rDownload process: {percentage:>5.2}% [{downloaded:.2} {unit}/{total:.2} {unit}]",
+                            percentage = (length & !0xFFF) as f64 * 100_f64 / length as f64,
+                            downloaded = (length & !0xFFF) as f64 / size_format.0,
+                            total = length as f64 / size_format.0,
+                            unit = size_format.1,
                         ))?;
 
                         {
@@ -326,6 +363,21 @@ fn main() -> Result<(), &'static str> {
 
                             if length != 0 {
                                 {
+                                    stream
+                                        .write_all(&[3])
+                                        .map_err(|_| "Couldn't write to stream!")?;
+
+                                    stream
+                                        .write_all(&(length >> 12).to_le_bytes())
+                                        .map_err(|_| "Couldn't write to stream!")?;
+
+                                    // Chunk size shifted by 4 to the right;
+                                    // (4096 = 0x1000) >> 4 = 0x100;
+                                    // [0, 1] <=> 0x0100 in Little-Endian;
+                                    stream
+                                        .write_all(&[0, 1])
+                                        .map_err(|_| "Couldn't write to stream!")?;
+
                                     let mut buffer: [u8; 1] = [0];
 
                                     stream
@@ -334,8 +386,8 @@ fn main() -> Result<(), &'static str> {
 
                                     if buffer[0] != 0 {
                                         console_write_line(format_args!(
-                                        "Failure occured while downloading file! Please try again."
-                                    ))?;
+                                            "Failure occured while downloading file! Please try again."
+                                        ))?;
 
                                         continue;
                                     }
@@ -347,13 +399,33 @@ fn main() -> Result<(), &'static str> {
 
                                 file.write_all(&mut buffer[..length])
                                     .map_err(|_| "Couldn't write data to local file!")?;
+
+                                stream
+                                    .write_all(&[4])
+                                    .map_err(|_| "Couldn't write to stream!")?;
+
+                                let mut buffer: [u8; 1] = [0];
+
+                                stream
+                                    .read_exact(&mut buffer)
+                                    .map_err(|_| "Couldn't read from stream!")?;
+
+                                if buffer[0] != 0 {
+                                    dbg!(buffer);
+
+                                    console_write_line(format_args!(
+                                        "Failure occured while closing file! Please restart session."
+                                    ))?;
+
+                                    return Err("Communication error occured while closing file!");
+                                }
                             }
                         }
 
                         console_write_line(format_args!(
-                            "\rDownload process: 100.00% [{0:.2} {1}/{0:.2} {1}]\nDownload complete.",
-                            length as f64 / size_format.0,
-                            size_format.1
+                            "\rDownload process: 100.00% [{length:.2} {unit}/{length:.2} {unit}]\nDownload complete.",
+                            length = length as f64 / size_format.0,
+                            unit = size_format.1
                         ))?;
                     }
                 } else {
@@ -366,7 +438,7 @@ fn main() -> Result<(), &'static str> {
             }
         }
 
-        if matches!(line, "ex" | "exit") {
+        if matches!(line, "x" | "ex" | "exit") {
             EXIT.store(true, SeqCst);
 
             break;
@@ -510,8 +582,8 @@ fn client_connect(address: &str, password: &str) -> Result<TlsStream<TcpStream>,
     let mut stream: TlsStream<TcpStream> = TlsConnector::builder()
         .min_protocol_version(Some(Protocol::Tlsv12))
         .max_protocol_version(None)
-        .danger_accept_invalid_certs(false)
-        .danger_accept_invalid_hostnames(false)
+        .danger_accept_invalid_certs(cfg!(debug_assertions))
+        .danger_accept_invalid_hostnames(cfg!(debug_assertions))
         .build()
         .map_err(|_| "Failure occured while setting up environment for secure communication!")?
         .connect(
