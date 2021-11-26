@@ -295,7 +295,7 @@ fn main() -> Result<(), &'static str> {
                                     .map_err(|_| "Couldn't write to stream!")?;
 
                                 stream
-                                    .write_all(&index.to_le_bytes())
+                                    .write_all(&index.to_le_bytes()[..7])
                                     .map_err(|_| "Couldn't write to stream!")?;
 
                                 // Chunk size shifted by 4 to the right;
@@ -340,6 +340,14 @@ fn main() -> Result<(), &'static str> {
 
                                     continue 'main_loop;
                                 }
+                            }
+
+                            stream
+                                .read_exact(&mut buffer[..3])
+                                .map_err(|_| "Couldn't read from stream!")?;
+
+                            if buffer[..3] != [0, 0x10, 0] {
+                                return Err("Server sent chunk with different size than expected!");
                             }
 
                             stream
@@ -391,6 +399,12 @@ fn main() -> Result<(), &'static str> {
 
                                         continue;
                                     }
+                                }
+
+                                if buffer[..3] != [length as u8, (length >> 8) as u8 & 0xF, 0] {
+                                    return Err(
+                                        "Server sent chunk with different size than expected!",
+                                    );
                                 }
 
                                 stream
@@ -573,6 +587,9 @@ fn write_string<'a, 'b>(
 }
 
 fn client_connect(address: &str, password: &str) -> Result<TlsStream<TcpStream>, &'static str> {
+    const LOGIN_FAIL_MESSAGE: &'static str =
+        "Connection failed! Make sure the address and password are correct!";
+
     let length: u8 = password
         .as_bytes()
         .len()
@@ -595,11 +612,13 @@ fn client_connect(address: &str, password: &str) -> Result<TlsStream<TcpStream>,
 
     stream
         .write_all(&[length])
-        .map_err(|_| "Connection failed! Make sure the address and password are correct!")?;
+        .map_err(|_| LOGIN_FAIL_MESSAGE)?;
 
     stream
         .write_all(password.as_bytes())
-        .map_err(|_| "Connection failed! Make sure the address and password are correct!")?;
+        .map_err(|_| LOGIN_FAIL_MESSAGE)?;
+
+    stream.flush().map_err(|_| LOGIN_FAIL_MESSAGE)?;
 
     // Server responds with a zero byte just to asure the client password is correct.
     {
@@ -607,7 +626,7 @@ fn client_connect(address: &str, password: &str) -> Result<TlsStream<TcpStream>,
 
         stream
             .read_exact(&mut buffer)
-            .map_err(|_| "Connection failed! Make sure the address and password are correct!")?;
+            .map_err(|_| LOGIN_FAIL_MESSAGE)?;
     }
 
     Ok(stream)

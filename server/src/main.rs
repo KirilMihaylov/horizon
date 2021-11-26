@@ -204,18 +204,17 @@ enum Command {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum DownloadSubcommand {
     KeepAlive,
-    List(u16),
-    ChunkHash(u64, u16),
-    DownloadChunk(u64, u16),
+    List { size: u16 },
+    ChunkHash { index: u64, size: u16 },
+    DownloadChunk { index: u64, size: u16 },
     CloseFile,
 }
 
 fn validate_path_segment(segment: &str) -> bool {
     segment.chars().all(|character: char| {
         character.is_alphanumeric()
-            || character.is_whitespace()
             || [
-                '.', '-', '_', '=', '~', '!', ',', '(', ')', '[', ']', '{', '}',
+                ' ', '\t', '.', '-', '_', '=', '~', '!', ',', '(', ')', '[', ']', '{', '}',
             ]
             .contains(&character)
     }) && segment != ".."
@@ -294,21 +293,35 @@ async fn read_client_download_subcommand(
 
     Ok(match command_byte {
         0 => DownloadSubcommand::KeepAlive,
-        1 => DownloadSubcommand::List(read_chunk_size(stream).await?),
-        2 => DownloadSubcommand::ChunkHash(
-            stream
-                .read_u64_le()
-                .await
-                .map_err(|error: IOError| error.to_string())?,
-            read_chunk_size(stream).await?,
-        ),
-        3 => DownloadSubcommand::DownloadChunk(
-            stream
-                .read_u64_le()
-                .await
-                .map_err(|error: IOError| error.to_string())?,
-            read_chunk_size(stream).await?,
-        ),
+        1 => DownloadSubcommand::List {
+            size: read_chunk_size(stream).await?,
+        },
+        2 => DownloadSubcommand::ChunkHash {
+            index: {
+                let mut buffer: [u8; 8] = [0; 8];
+
+                stream
+                    .read_exact(&mut buffer[..7])
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                u64::from_le_bytes(buffer)
+            },
+            size: read_chunk_size(stream).await?,
+        },
+        3 => DownloadSubcommand::DownloadChunk {
+            index: {
+                let mut buffer: [u8; 8] = [0; 8];
+
+                stream
+                    .read_exact(&mut buffer[..7])
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                u64::from_le_bytes(buffer)
+            },
+            size: read_chunk_size(stream).await?,
+        },
         4 => DownloadSubcommand::CloseFile,
         _ => return Err(String::from("Client sent unknown download command!")),
     })
@@ -445,8 +458,8 @@ async fn client_download_file(
                 .write_u8(0)
                 .await
                 .map_err(|error: IOError| error.to_string())?,
-            DownloadSubcommand::List(chunk_size) => {
-                let chunk_size: u32 = chunk_size.wrapping_shl(4) as u32;
+            DownloadSubcommand::List { size } => {
+                let chunk_size: u32 = (size as u32).wrapping_shl(4);
 
                 stream
                     .write_u8(0)
@@ -454,7 +467,7 @@ async fn client_download_file(
                     .map_err(|error: IOError| error.to_string())?;
 
                 stream
-                    .write_u64_le(length / chunk_size as u64)
+                    .write_all(&(length / chunk_size as u64).to_le_bytes()[..7])
                     .await
                     .map_err(|error: IOError| error.to_string())?;
 
@@ -462,24 +475,24 @@ async fn client_download_file(
                     let last_chunk_size: [u8; 4] =
                         ((length % chunk_size as u64) as u32).to_le_bytes();
 
-                    for index in 0..3 {
-                        stream
-                            .write_u8(last_chunk_size[index])
-                            .await
-                            .map_err(|error: IOError| error.to_string())?;
-                    }
+                    stream
+                        .write_all(&last_chunk_size[..3])
+                        .await
+                        .map_err(|error: IOError| error.to_string())?;
                 }
             }
-            DownloadSubcommand::ChunkHash(index, chunk_size) => {
-                let chunk_size: u32 = chunk_size.wrapping_shl(4) as u32;
+            DownloadSubcommand::ChunkHash { index, size } => {
+                let chunk_size: u32 = (size as u32).wrapping_shl(4);
 
                 file.seek(SeekFrom::Start(index.wrapping_mul(chunk_size as u64)))
                     .await
                     .map_err(|error: IOError| error.to_string())?;
 
+                let chunks: u64 = length / chunk_size as u64;
+
                 let mut buffer: Box<[u8]> = vec![
                     0;
-                    match index.cmp(&(length / chunk_size as u64)) {
+                    match index.cmp(&chunks) {
                         Ordering::Less => {
                             chunk_size as usize
                         }
@@ -511,8 +524,8 @@ async fn client_download_file(
                     .await
                     .map_err(|error: IOError| error.to_string())?;
             }
-            DownloadSubcommand::DownloadChunk(index, chunk_size) => {
-                let chunk_size: u32 = (chunk_size as u32).wrapping_shl(4);
+            DownloadSubcommand::DownloadChunk { index, size } => {
+                let chunk_size: u32 = (size as u32).wrapping_shl(4);
 
                 file.seek(SeekFrom::Start(index.wrapping_mul(chunk_size as u64)))
                     .await
@@ -535,6 +548,11 @@ async fn client_download_file(
 
                 stream
                     .write_u8(0)
+                    .await
+                    .map_err(|error: IOError| error.to_string())?;
+
+                stream
+                    .write_all(&buffer.len().to_le_bytes()[..3])
                     .await
                     .map_err(|error: IOError| error.to_string())?;
 
@@ -563,6 +581,11 @@ async fn handle_client_loop(
 ) -> Result<(), String> {
     stream
         .write_u8(0)
+        .await
+        .map_err(|error: IOError| error.to_string())?;
+
+    stream
+        .flush()
         .await
         .map_err(|error: IOError| error.to_string())?;
 
